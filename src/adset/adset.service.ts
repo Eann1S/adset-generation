@@ -9,10 +9,22 @@ import { Node, NodeDocument } from './node.schema';
 import { CreateNodeDto } from './dto/create.node.dto';
 import { AdsetFilterDto } from './dto/adset.filter.dto';
 import { UpdateNodeDto } from './dto/update.node.dto';
+import { RedisService } from '../redis/redis.service';
 
 @Injectable()
 export class AdsetService {
-  constructor(@InjectModel(Node.name) private nodeModel: Model<Node>) {}
+  private readonly cacheKeys = {
+    node: (id: string) => `node-${id}`,
+    adset: (filter: AdsetFilterDto, nodeId?: string) =>
+      `adset-${nodeId || 'root'}-${JSON.stringify(filter)}`,
+  };
+  private readonly adsetTTL = parseInt(process.env.ADSET_TTL || '15');
+  private readonly nodeTTL = parseInt(process.env.NODE_TTL || '300');
+
+  constructor(
+    @InjectModel(Node.name) private nodeModel: Model<Node>,
+    private redisService: RedisService,
+  ) {}
 
   async createNode(node: CreateNodeDto) {
     const { name, conditions, probability, parentId } = node;
@@ -27,6 +39,7 @@ export class AdsetService {
       parent,
     });
     await createdNode.save();
+    await this.clearRelatedCache();
     return this.getNode(createdNode._id.toString());
   }
 
@@ -46,6 +59,11 @@ export class AdsetService {
     if (!node) {
       throw new NotFoundException('Node not found');
     }
+    await this.redisService.set(
+      this.cacheKeys.node(node._id.toString()),
+      node,
+      this.nodeTTL,
+    );
     return node;
   }
 
@@ -54,6 +72,11 @@ export class AdsetService {
     if (!node) {
       throw new NotFoundException('Node not found');
     }
+    await this.redisService.set(
+      this.cacheKeys.node(node._id.toString()),
+      node,
+      this.nodeTTL,
+    );
     return node;
   }
 
@@ -64,6 +87,11 @@ export class AdsetService {
     if (!node) {
       throw new NotFoundException('Root node not found');
     }
+    await this.redisService.set(
+      this.cacheKeys.node(node._id.toString()),
+      node,
+      this.nodeTTL,
+    );
     return node;
   }
 
@@ -71,6 +99,15 @@ export class AdsetService {
     const updatedNode = await this.nodeModel.findByIdAndUpdate(id, node, {
       new: true,
     });
+    if (!updatedNode) {
+      throw new NotFoundException('Node not found');
+    }
+    await this.clearRelatedCache();
+    await this.redisService.set(
+      this.cacheKeys.node(updatedNode._id.toString()),
+      updatedNode,
+      this.nodeTTL,
+    );
     return updatedNode;
   }
 
@@ -86,15 +123,28 @@ export class AdsetService {
       if (idx !== -1) {
         node.parent.children.splice(idx, 1);
         await node.parent.save();
+        await this.redisService.set(
+          this.cacheKeys.node(node.parent._id.toString()),
+          node.parent,
+          this.nodeTTL,
+        );
       }
     }
     await node.deleteOne();
+    await this.clearRelatedCache();
+    await this.redisService.del(this.cacheKeys.node(id));
   }
 
   async generateAdSet(
     filter: AdsetFilterDto,
     nodeId?: string,
   ): Promise<NodeDocument[]> {
+    const key = this.getCacheKey(filter, nodeId);
+    const cachedNodes = await this.getCachedNodes(key);
+    if (cachedNodes) {
+      return cachedNodes;
+    }
+
     let node: NodeDocument;
     if (!nodeId) {
       node = await this.getRootNode();
@@ -103,13 +153,17 @@ export class AdsetService {
     }
 
     if (!node.children || node.children.length === 0) {
+      await this.cacheNodes(key, [node]);
       return [node];
     }
 
     const filteredChildren = this.filterChildren(node, filter);
     const child = this.getRandomChild(filteredChildren);
     const adset = await this.generateAdSet(filter, child._id.toString());
-    return [node, ...adset];
+
+    const result = [node, ...adset];
+    await this.cacheNodes(key, result);
+    return result;
   }
 
   private filterChildren(
@@ -139,5 +193,26 @@ export class AdsetService {
   private getTotalProbability(children: NodeDocument[]) {
     const total = children.reduce((acc, child) => acc + child.probability, 0);
     return total;
+  }
+
+  private getCacheKey(filter: AdsetFilterDto, nodeId?: string): string {
+    filter = Object.fromEntries(
+      Object.entries(filter).sort(([keyA], [keyB]) => keyA.localeCompare(keyB)),
+    );
+    return this.cacheKeys.adset(filter, nodeId);
+  }
+
+  private async getCachedNodes(key: string): Promise<NodeDocument[] | null> {
+    const cachedNodes = await this.redisService.get<NodeDocument[]>(key);
+    return cachedNodes;
+  }
+
+  private async cacheNodes(key: string, nodes: NodeDocument[]): Promise<void> {
+    await this.redisService.set(key, nodes, this.adsetTTL);
+  }
+
+  private async clearRelatedCache(): Promise<void> {
+    const keys = await this.redisService.scan('adset-*');
+    await Promise.all(keys.map((key) => this.redisService.del(key)));
   }
 }
